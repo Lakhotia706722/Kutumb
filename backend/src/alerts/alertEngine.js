@@ -124,4 +124,46 @@ const deleteAlertsForDocument = async (documentId) => {
   await Alert.deleteMany({ document: documentId });
 };
 
-module.exports = { runAlertSweep, deleteAlertsForDocument };
+/**
+ * Reconcile alerts for a single document after expiry date changes.
+ * This is the "smart merge" behavior: generates new alerts for updated date.
+ * Old alerts should be deleted separately before calling this.
+ */
+const runAlertSweepForDocument = async (doc) => {
+  const { offsets } = getRule(doc.category, doc.title);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  for (const daysBefore of offsets) {
+    const triggerDate = new Date(doc.expiryDate);
+    triggerDate.setDate(triggerDate.getDate() - daysBefore);
+    triggerDate.setHours(0, 0, 0, 0);
+
+    const message = buildMessage(
+      doc.category,
+      doc.title,
+      Math.ceil((doc.expiryDate - today) / (1000 * 60 * 60 * 24)),
+      new Date(doc.expiryDate)
+    );
+
+    // Upsert creates or updates the alert
+    await Alert.updateOne(
+      { document: doc._id, daysBeforeExpiry: daysBefore },
+      {
+        $setOnInsert: {
+          family: doc.family,
+          document: doc._id,
+          daysBeforeExpiry: daysBefore,
+          status: 'pending',
+        },
+        $set: {
+          message,
+          triggerDate,
+        },
+      },
+      { upsert: true }
+    );
+  }
+};
+
+module.exports = { runAlertSweep, deleteAlertsForDocument, runAlertSweepForDocument };

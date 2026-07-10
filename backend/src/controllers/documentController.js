@@ -1,8 +1,9 @@
 const Document = require('../models/Document');
 const { CATEGORIES } = require('../models/Document');
 const FamilyMembership = require('../models/FamilyMembership');
+const Alert = require('../models/Alert');
 const storage = require('../storage');
-const { deleteAlertsForDocument } = require('../alerts/alertEngine');
+const { deleteAlertsForDocument, runAlertSweepForDocument } = require('../alerts/alertEngine');
 
 // ─── Helper: resolve the caller's familyId (cached on req after first call) ──
 const getFamilyId = async (userId) => {
@@ -105,6 +106,9 @@ const createDocument = async (req, res) => {
 
 // ─── PATCH /api/documents/:id ─────────────────────────────────────────────────
 // Metadata-only update (no file replacement in MVP — user deletes+re-adds instead).
+// If expiryDate changes, trigger alert reconciliation (smart merge):
+//   - Delete old alerts (they're now stale)
+//   - Generate new alerts based on updated date
 const updateDocument = async (req, res) => {
   try {
     const familyId = await getFamilyId(req.userId);
@@ -112,6 +116,8 @@ const updateDocument = async (req, res) => {
     if (!doc) return res.status(404).json({ message: 'Document not found.' });
 
     const { category, title, issueDate, expiryDate, renewalRequired, notes } = req.body;
+
+    const expiryDateChanged = expiryDate !== undefined && doc.expiryDate?.toString() !== new Date(expiryDate)?.toString();
 
     if (category !== undefined) {
       if (!CATEGORIES.includes(category))
@@ -129,6 +135,20 @@ const updateDocument = async (req, res) => {
     if (notes !== undefined) doc.notes = notes;
 
     await doc.save();
+
+    // Smart merge: if expiry date changed, reconcile alerts
+    if (expiryDateChanged) {
+      try {
+        await deleteAlertsForDocument(doc._id);
+        if (doc.expiryDate) {
+          await runAlertSweepForDocument(doc);
+        }
+      } catch (alertErr) {
+        console.warn(`[DocumentController] Alert reconciliation failed for doc ${doc._id}:`, alertErr.message);
+        // Don't fail the API response — alerts can be fixed on next scheduled sweep
+      }
+    }
+
     await doc.populate('uploadedBy', 'name');
     res.json({ message: 'Document updated.', document: formatDoc(doc.toObject()) });
   } catch (err) {
